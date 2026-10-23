@@ -9,7 +9,7 @@
  ╚═╝  ╚═══╝ ╚═════╝ ╚══════╝╚══════╝ ╚═════╝    ╚═╝      ╚═╝   ╚══════╝
 ```
 
-### `whoami` → Security Researcher · Malware Analyst · Low-Level Dev
+### `whoami` → Simple person · Malware Analyst · Low-Level Dev
 
 [![Typing SVG](https://readme-typing-svg.demolab.com?font=Fira+Code&size=16&duration=3000&pause=800&color=00FF41&center=true&vCenter=true&width=500&lines=Reverse+Engineering+%7C+Binary+Analysis;Malware+Research+%26+Threat+Intelligence;Low-Level+Systems+%26+Exploit+Dev;CTF+Player+%7C+Always+Learning)](https://git.io/typing-svg)
 
